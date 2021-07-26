@@ -19,6 +19,7 @@ class Client {
  public:
   static Client *inst();
   int            main(int argc, char *argv[]);
+  void           reset();
 
   Glib::RefPtr<Gtk::Application>      gtk_app;
   Glib::RefPtr<Gdk::Display>          gdk_display;
@@ -37,7 +38,9 @@ class Client {
   const std::string        getValidPath(const std::vector<std::string> &paths) const;
   void                     handleOutput(struct waybar_output &output);
   bool                     isValidOutput(const Json::Value &config, struct waybar_output &output);
-  auto                     setupConfig(const std::string &config_file) -> void;
+  auto                     setupConfig(const std::string &config_file, int depth) -> void;
+  auto                     resolveConfigIncludes(Json::Value &config, int depth) -> void;
+  auto                     mergeConfig(Json::Value &a_config_, Json::Value &b_config_) -> void;
   auto                     setupCss(const std::string &css_file) -> void;
   struct waybar_output &   getOutput(void *);
   std::vector<Json::Value> getOutputConfigs(struct waybar_output &output);
@@ -50,6 +53,7 @@ class Client {
   static void handleOutputDescription(void *, struct zxdg_output_v1 *, const char *);
   void        handleMonitorAdded(Glib::RefPtr<Gdk::Monitor> monitor);
   void        handleMonitorRemoved(Glib::RefPtr<Gdk::Monitor> monitor);
+  void        handleDeferredMonitorRemoval(Glib::RefPtr<Gdk::Monitor> monitor);
 
   Json::Value                     config_;
   Glib::RefPtr<Gtk::StyleContext> style_context_;

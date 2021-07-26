@@ -1,6 +1,6 @@
 project(
     'waybar', 'cpp', 'c',
-    version: '0.9.5',
+    version: '0.9.7',
     license: 'MIT',
     meson_version: '>= 0.49.0',
     default_options : [
@@ -80,7 +80,7 @@ is_openbsd = host_machine.system() == 'openbsd'
 
 thread_dep = dependency('threads')
 fmt = dependency('fmt', version : ['>=5.3.0'], fallback : ['fmt', 'fmt_dep'])
-spdlog = dependency('spdlog', version : ['>=1.8.0'], fallback : ['spdlog', 'spdlog_dep'], default_options : ['external_fmt=true'])
+spdlog = dependency('spdlog', version : ['>=1.8.5'], fallback : ['spdlog', 'spdlog_dep'], default_options : ['external_fmt=true'])
 wayland_client = dependency('wayland-client')
 wayland_cursor = dependency('wayland-cursor')
 wayland_protos = dependency('wayland-protocols')
@@ -94,7 +94,9 @@ libnl = dependency('libnl-3.0', required: get_option('libnl'))
 libnlgen = dependency('libnl-genl-3.0', required: get_option('libnl'))
 libpulse = dependency('libpulse', required: get_option('pulseaudio'))
 libudev = dependency('libudev', required: get_option('libudev'))
+libevdev = dependency('libevdev', required: get_option('libevdev'))
 libmpdclient = dependency('libmpdclient', required: get_option('mpd'))
+xkbregistry = dependency('xkbregistry')
 
 libsndio = compiler.find_library('sndio', required: get_option('sndio'))
 if libsndio.found()
@@ -112,7 +114,11 @@ gtk_layer_shell = dependency('gtk-layer-shell-0',
         required: get_option('gtk-layer-shell'),
         fallback : ['gtk-layer-shell', 'gtk_layer_shell_dep'])
 systemd = dependency('systemd', required: get_option('systemd'))
-tz_dep = dependency('date', default_options : [ 'use_system_tzdb=true' ], modules : [ 'date::date', 'date::date-tz' ], fallback: [ 'date', 'tz_dep' ])
+tz_dep = dependency('date',
+    required: false,
+    default_options : [ 'use_system_tzdb=true' ],
+    modules : [ 'date::date', 'date::date-tz' ],
+    fallback: [ 'date', 'tz_dep' ])
 
 prefix = get_option('prefix')
 sysconfdir = get_option('sysconfdir')
@@ -136,7 +142,6 @@ src_files = files(
     'src/factory.cpp',
     'src/AModule.cpp',
     'src/ALabel.cpp',
-    'src/modules/clock.cpp',
     'src/modules/custom.cpp',
     'src/modules/disk.cpp',
     'src/modules/idle_inhibitor.cpp',
@@ -144,6 +149,7 @@ src_files = files(
     'src/main.cpp',
     'src/bar.cpp',
     'src/client.cpp',
+    'src/util/ustring_clen.cpp'
 )
 
 if is_linux
@@ -211,6 +217,11 @@ if libudev.found() and (is_linux or libepoll.found())
     src_files += 'src/modules/backlight.cpp'
 endif
 
+if libevdev.found() and (is_linux or libepoll.found())
+    add_project_arguments('-DHAVE_LIBEVDEV', language: 'cpp')
+    src_files += 'src/modules/keyboard_state.cpp'
+endif
+
 if libmpdclient.found()
     add_project_arguments('-DHAVE_LIBMPDCLIENT', language: 'cpp')
     src_files += 'src/modules/mpd/mpd.cpp'
@@ -236,6 +247,13 @@ if get_option('rfkill').enabled()
     endif
 endif
 
+if tz_dep.found()
+    add_project_arguments('-DHAVE_LIBDATE', language: 'cpp')
+    src_files += 'src/modules/clock.cpp'
+else
+    src_files += 'src/modules/simpleclock.cpp'
+endif
+
 subdir('protocol')
 
 executable(
@@ -259,9 +277,11 @@ executable(
         libudev,
         libepoll,
         libmpdclient,
+        libevdev,
         gtk_layer_shell,
         libsndio,
-        tz_dep
+        tz_dep,
+				xkbregistry 
     ],
     include_directories: [include_directories('include')],
     install: true,
@@ -299,11 +319,13 @@ if scdoc.found()
         'waybar-custom.5.scd',
         'waybar-disk.5.scd',
         'waybar-idle-inhibitor.5.scd',
+        'waybar-keyboard-state.5.scd',
         'waybar-memory.5.scd',
         'waybar-mpd.5.scd',
         'waybar-network.5.scd',
         'waybar-pulseaudio.5.scd',
         'waybar-river-tags.5.scd',
+        'waybar-sway-language.5.scd',
         'waybar-sway-mode.5.scd',
         'waybar-sway-window.5.scd',
         'waybar-sway-workspaces.5.scd',

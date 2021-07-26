@@ -120,18 +120,24 @@ void waybar::Client::handleOutputDone(void *data, struct zxdg_output_v1 * /*xdg_
   auto client = waybar::Client::inst();
   try {
     auto &output = client->getOutput(data);
-    spdlog::debug("Output detection done: {} ({})", output.name, output.identifier);
-
-    auto configs = client->getOutputConfigs(output);
-    if (configs.empty()) {
+    /**
+     * Multiple .done events may arrive in batch. In this case libwayland would queue
+     * xdg_output.destroy and dispatch all pending events, triggering this callback several times
+     * for the same output. .done events can also arrive after that for a scale or position changes.
+     * We wouldn't want to draw a duplicate bar for each such event either.
+     *
+     * All the properties we care about are immutable so it's safe to delete the xdg_output object
+     * on the first event and use the ptr value to check that the callback was already invoked.
+     */
+    if (output.xdg_output) {
       output.xdg_output.reset();
-    } else {
-      wl_display_roundtrip(client->wl_display);
-      for (const auto &config : configs) {
-        client->bars.emplace_back(std::make_unique<Bar>(&output, config));
-        Glib::RefPtr<Gdk::Screen> screen = client->bars.back()->window.get_screen();
-        client->style_context_->add_provider_for_screen(
-            screen, client->css_provider_, GTK_STYLE_PROVIDER_PRIORITY_USER);
+      spdlog::debug("Output detection done: {} ({})", output.name, output.identifier);
+
+      auto configs = client->getOutputConfigs(output);
+      if (!configs.empty()) {
+        for (const auto &config : configs) {
+          client->bars.emplace_back(std::make_unique<Bar>(&output, config));
+        }
       }
     }
   } catch (const std::exception &e) {
@@ -173,6 +179,16 @@ void waybar::Client::handleMonitorAdded(Glib::RefPtr<Gdk::Monitor> monitor) {
 
 void waybar::Client::handleMonitorRemoved(Glib::RefPtr<Gdk::Monitor> monitor) {
   spdlog::debug("Output removed: {} {}", monitor->get_manufacturer(), monitor->get_model());
+  /* This event can be triggered from wl_display_roundtrip called by GTK or our code.
+   * Defer destruction of bars for the output to the next iteration of the event loop to avoid
+   * deleting objects referenced by currently executed code.
+   */
+  Glib::signal_idle().connect_once(
+      sigc::bind(sigc::mem_fun(*this, &Client::handleDeferredMonitorRemoval), monitor),
+      Glib::PRIORITY_HIGH_IDLE);
+}
+
+void waybar::Client::handleDeferredMonitorRemoval(Glib::RefPtr<Gdk::Monitor> monitor) {
   for (auto it = bars.begin(); it != bars.end();) {
     if ((*it)->output->monitor == monitor) {
       auto output_name = (*it)->output->name;
@@ -191,9 +207,13 @@ std::tuple<const std::string, const std::string> waybar::Client::getConfigs(
     const std::string &config, const std::string &style) const {
   auto config_file = config.empty() ? getValidPath({
                                           "$XDG_CONFIG_HOME/waybar/config",
+                                          "$XDG_CONFIG_HOME/waybar/config.jsonc",
                                           "$HOME/.config/waybar/config",
+                                          "$HOME/.config/waybar/config.jsonc",
                                           "$HOME/waybar/config",
+                                          "$HOME/waybar/config.jsonc",
                                           "/etc/xdg/waybar/config",
+                                          "/etc/xdg/waybar/config.jsonc",
                                           SYSCONFDIR "/xdg/waybar/config",
                                           "./resources/config",
                                       })
@@ -214,14 +234,62 @@ std::tuple<const std::string, const std::string> waybar::Client::getConfigs(
   return {config_file, css_file};
 }
 
-auto waybar::Client::setupConfig(const std::string &config_file) -> void {
+auto waybar::Client::setupConfig(const std::string &config_file, int depth) -> void {
+  if (depth > 100) {
+    throw std::runtime_error("Aborting due to likely recursive include in config files");
+  }
   std::ifstream file(config_file);
   if (!file.is_open()) {
     throw std::runtime_error("Can't open config file");
   }
   std::string      str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
   util::JsonParser parser;
-  config_ = parser.parse(str);
+  Json::Value      tmp_config_ = parser.parse(str);
+  if (tmp_config_.isArray()) {
+    for (auto &config_part : tmp_config_) {
+      resolveConfigIncludes(config_part, depth);
+    }
+  } else {
+    resolveConfigIncludes(tmp_config_, depth);
+  }
+  mergeConfig(config_, tmp_config_);
+}
+
+auto waybar::Client::resolveConfigIncludes(Json::Value &config, int depth) -> void {
+  Json::Value includes = config["include"];
+  if (includes.isArray()) {
+    for (const auto &include : includes) {
+      spdlog::info("Including resource file: {}", include.asString());
+      setupConfig(getValidPath({include.asString()}), ++depth);
+    }
+  } else if (includes.isString()) {
+    spdlog::info("Including resource file: {}", includes.asString());
+    setupConfig(getValidPath({includes.asString()}), ++depth);
+  }
+}
+
+auto waybar::Client::mergeConfig(Json::Value &a_config_, Json::Value &b_config_) -> void {
+  if (!a_config_) {
+    // For the first config
+    a_config_ = b_config_;
+  } else if (a_config_.isObject() && b_config_.isObject()) {
+    for (const auto &key : b_config_.getMemberNames()) {
+      if (a_config_[key].isObject() && b_config_[key].isObject()) {
+        mergeConfig(a_config_[key], b_config_[key]);
+      } else {
+        a_config_[key] = b_config_[key];
+      }
+    }
+  } else if (a_config_.isArray() && b_config_.isArray()) {
+    // This can happen only on the top-level array of a multi-bar config
+    for (Json::Value::ArrayIndex i = 0; i < b_config_.size(); i++) {
+      if (a_config_[i].isObject() && b_config_[i].isObject()) {
+        mergeConfig(a_config_[i], b_config_[i]);
+      }
+    }
+  } else {
+    spdlog::error("Cannot merge config, conflicting or invalid JSON types");
+  }
 }
 
 auto waybar::Client::setupCss(const std::string &css_file) -> void {
@@ -232,6 +300,9 @@ auto waybar::Client::setupCss(const std::string &css_file) -> void {
   if (!css_provider_->load_from_path(css_file)) {
     throw std::runtime_error("Can't open style file");
   }
+  // there's always only one screen
+  style_context_->add_provider_for_screen(
+      Gdk::Screen::get_default(), css_provider_, GTK_STYLE_PROVIDER_PRIORITY_USER);
 }
 
 void waybar::Client::bindInterfaces() {
@@ -297,16 +368,15 @@ int waybar::Client::main(int argc, char *argv[]) {
   }
   wl_display = gdk_wayland_display_get_wl_display(gdk_display->gobj());
   auto [config_file, css_file] = getConfigs(config, style);
-  setupConfig(config_file);
+  setupConfig(config_file, 0);
   setupCss(css_file);
   bindInterfaces();
   gtk_app->hold();
   gtk_app->run();
   bars.clear();
-  zxdg_output_manager_v1_destroy(xdg_output_manager);
-  zwlr_layer_shell_v1_destroy(layer_shell);
-  zwp_idle_inhibit_manager_v1_destroy(idle_inhibit_manager);
-  wl_registry_destroy(registry);
-  wl_display_disconnect(wl_display);
   return 0;
+}
+
+void waybar::Client::reset() {
+  gtk_app->quit();
 }
